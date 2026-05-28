@@ -1,0 +1,120 @@
+#!/bin/bash
+
+# ==========================================
+# ヘルプ表示関数
+# ==========================================
+show_help() {
+    echo -e "\e[1m名前:\e[0m"
+    echo "  vjwt - CLI用のローカルJWTデコード＆署名検証ツール"
+    echo ""
+    echo -e "\e[1m使い方:\e[0m"
+    echo "  echo \$JWT | vjwt [オプション]"
+    echo "  vjwt \$JWT [オプション]"
+    echo ""
+    echo -e "\e[1mオプション:\e[0m"
+    echo "  -i, --insecure  署名検証をスキップしてペイロードのみをデコードします"
+    echo "  -h, --help      このヘルプを表示します"
+    echo ""
+    echo -e "\e[1m環境変数:\e[0m"
+    echo "  VJWT_SECRET     署名検証（HS256）に使用する秘密鍵（シークレット）"
+    echo ""
+    echo -e "\e[1m使用例:\e[0m"
+    echo "  # 秘密鍵を設定して検証付きでデコード"
+    echo "  export VJWT_SECRET=\"my_secret_key\""
+    echo "  echo \$JWT | vjwt"
+    echo ""
+    echo "  # 署名検証をスキップして中身だけ確認"
+    echo "  echo \$JWT | vjwt -i"
+}
+
+# ==========================================
+# オプションの解析 (-i, -h, --help)
+# ==========================================
+INSECURE_MODE=false
+
+for arg in "$@"; do
+    if [ "$arg" = "-h" ] || [ "$arg" = "--help" ]; then
+        show_help
+        exit 0
+    fi
+    if [ "$arg" = "-i" ] || [ "$arg" = "--insecure" ]; then
+        INSECURE_MODE=true
+    fi
+done
+
+# ==========================================
+# パイプ（標準入力）または引数からJWTを取得
+# ==========================================
+JWT_ARG=""
+for arg in "$@"; do
+    if [ "$arg" != "-i" ] && [ "$arg" != "--insecure" ] && [ "$arg" != "-h" ] && [ "$arg" != "--help" ]; then
+        JWT_ARG="$arg"
+        break
+    fi
+done
+
+if [ -t 0 ]; then
+    # 標準入力が端末（パイプなし）かつ引数も空ならヘルプを表示
+    if [ -z "$JWT_ARG" ]; then
+        show_help
+        exit 0
+    fi
+    JWT="$JWT_ARG"
+else
+    # パイプから取得
+    JWT=$(cat)
+fi
+
+# 改行や空白を削除
+JWT=$(echo -n "$JWT" | tr -d '[:space:]')
+
+# パイプで空文字が渡された場合のガード
+if [ -z "$JWT" ]; then
+    echo -e "\e[31m❌ エラー: JWTトークンが空です。\e[0m"
+    show_help
+    exit 1
+fi
+
+# ==========================================
+# 1. JWTを分解
+# ==========================================
+HEADER=$(echo -n "$JWT" | cut -d'.' -f1)
+PAYLOAD=$(echo -n "$JWT" | cut -d'.' -f2)
+ORIGINAL_SIGNATURE=$(echo -n "$JWT" | cut -d'.' -f3)
+
+# ==========================================
+# 2. モードに応じた処理
+# ==========================================
+decode_payload() {
+    local b64_text=$(echo -n "$PAYLOAD" | tr '_-' '/+')
+    local len=$((${#b64_text} % 4))
+    if [ $len -eq 2 ]; then b64_text="${b64_text}=="; fi
+    if [ $len -eq 3 ]; then b64_text="${b64_text}="; fi
+    echo -n "$b64_text" | base64 --decode 2>/dev/null | jq .
+}
+
+if [ "$INSECURE_MODE" = true ]; then
+    # --- 署名検証なし（インセキュアモード） ---
+    echo -e "\e[33m⚠️  警告: 署名検証をスキップしました（検証なし）\e[0m"
+    decode_payload
+else
+    # --- 署名検証あり（通常モード） ---
+    if [ -z "$VJWT_SECRET" ]; then
+        echo -e "\e[31m❌ エラー: 秘密鍵の環境変数 VJWT_SECRET が設定されていません。\e[0m"
+        echo "先に環境変数を設定するか、-i オプション（検証なし）を使用してください。"
+        echo "設定例: export VJWT_SECRET=\"your_secret_key\""
+        exit 1
+    fi
+
+    HEADER_PAYLOAD="${HEADER}.${PAYLOAD}"
+    CALCULATED_SIGNATURE=$(echo -n "$HEADER_PAYLOAD" | openssl dgst -sha256 -hmac "$VJWT_SECRET" -binary | base64 | tr -d '=' | tr '/+' '_-')
+
+    if [ "$ORIGINAL_SIGNATURE" = "$CALCULATED_SIGNATURE" ]; then
+        echo -e "\e[32m✅ 署名一致（改ざんなし）\e[0m"
+        decode_payload
+    else
+        echo -e "\e[31m❌ 署名不一致（改ざんの可能性、または秘密鍵が違います）\e[0m"
+        echo "※ 署名を無視して中身を見たい場合は -i オプションを付けてください。"
+        exit 1
+    fi
+fi
